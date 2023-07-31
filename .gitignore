@@ -3,3 +3,5 @@
 *.bin
 *.ncu-rep
 build
+*.egg-info
+qmatmul*

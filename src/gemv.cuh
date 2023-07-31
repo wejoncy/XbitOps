@@ -6,7 +6,9 @@ struct SampleData {
   short *scale;
   int32_t *qzero;
   short* f16weight;
-  short *out;
+  short* out;
+  int32_t bits;
+  int32_t group_size;
   struct {
     int input_size;
     int qweight_size;
