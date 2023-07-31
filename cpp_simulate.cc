@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <cstdint>
 #include <numeric>
+#include <sys/time.h>
 
 extern int MATRIX_M;
 extern int MATRIX_K;
@@ -11,6 +12,13 @@ const int width_element_per_block = 32 * 2;
 
 typedef unsigned short ushort;
 typedef unsigned int uint;
+
+struct uchar2 {
+  uint8_t x, y;
+};
+struct uint2 {
+  uint32_t x, y;
+};
 
 typedef ushort half;
 uint as_uint(const float x) { return *(uint*)&x; }
@@ -65,6 +73,7 @@ half __float2half_rn(float f) { return float_to_half(f); }
 
 float __int2float_rn(int x) { return (float)x; }
 float __short2half_rn(int x) { return float_to_half((float) x); }
+float __ushort2half_rn(int x) { return float_to_half((float)x); }
 float2 __halves2float2(float x, float y) { return {(x), (y)}; }
 float fmaf(float a, float b, float c) { return a * b + c; }
 
@@ -413,91 +422,236 @@ __device__ __forceinline__ uint8_t iterator_qweight(const uint32_t* ptr, int idx
   int first = start_bits / 32;
   int end_bits = (start_bits + WBITS);
   int second = end_bits / 32;
+  start_bits = start_bits % 32;
+  end_bits = end_bits % 32;
   if (first == second) {
     return (ptr[first] >> (start_bits)) & ((1 << WBITS) - 1);
   } else {
     uint8_t v = (ptr[first] >> (start_bits));
-    v |= (ptr[second]) & ((1 << (end_bits - 32) )- 1);
+    v |= (ptr[second]) & ((1 << (end_bits) )- 1);
     return v;
   }
 }
 
 template <typename T, int WBITS>
 __global__ void DequantizeAndUnpackWeight3567(T* out, uint32_t* qweight, T* scale, uint32_t* zeros, int group_size, const int qweight_rows, const int row_n) {
-  for (int bid = 0; bid < ((MATRIX_N * MATRIX_K * WBITS+31) / 32 + kBlockSize - 1) / kBlockSize; bid++) {
+  for (int bid = 0; bid < ((MATRIX_N * MATRIX_K + 31) / 32 + kBlockSize - 1) / kBlockSize; bid++) {
     __shared__ uint32_t qweight_shared[WBITS * kBlockSize];
     for (int tid = bid * kBlockSize; tid < (bid + 1) * kBlockSize; tid++) {
-      const int group_row_n = row_n * WBITS;
-      int total_qw = qweight_rows*row_n;
+  const int group_row_n = row_n * WBITS;
+  int total_qw = qweight_rows * row_n;
 
-      if (tid*32/5 >= total_qw)
-        return;
-      int theadidx_x = tid - kBlockSize * bid;
-      int thread_group = theadidx_x * WBITS;
-      int qweight_start = tid / row_n * group_row_n + tid % row_n;
-      for (int j = 0; j < WBITS; j++) {
-        int ind = qweight_start + row_n * j;
-        qweight_shared[thread_group + j] = ind < total_qw? qweight[ind]:0;
-      }
-    }
-    for (int tid = bid * kBlockSize; tid < (bid + 1) * kBlockSize; tid++) {
-      int theadidx_x = tid - kBlockSize * bid;
-      int thread_group = theadidx_x * WBITS;
-      const int group_row_n = row_n * WBITS;
-      const int max_num_in_bits = (1 << WBITS) - 1;
-      const int col_ind = (tid % row_n);
-      const int compress_group_size = 32;
-      const int fp16_weight_in_row = tid / row_n * compress_group_size;
-      half scale_v[4];
-      const int scale_zero_from = fp16_weight_in_row / group_size;
-      const int scale_zero_to = (fp16_weight_in_row + compress_group_size) / group_size;
+  if (tid * WBITS >= total_qw) {
+    return;
+  }
+  int theadidx_x = tid - kBlockSize * bid;
+  uint32_t* qweight_thread = qweight_shared + WBITS * theadidx_x;
 
-      // decompress scales
-      for (int i = 0, scale_zero_from_i = scale_zero_from; scale_zero_from_i <= scale_zero_to; scale_zero_from_i++, i++) {
-        scale_v[i] = scale[scale_zero_from_i * row_n + col_ind];
-      }
+  int qweight_start = tid / row_n * group_row_n + tid % row_n;
+  for (int j = 0; j < WBITS; j++) {
+    int ind = qweight_start + row_n * j;
+    qweight_thread[j] = ind < total_qw ? qweight[ind] : 0;
+  }
+  }
+  for (int tid = bid * kBlockSize; tid < (bid + 1) * kBlockSize; tid++) {
+  int theadidx_x = tid - kBlockSize * bid;
+  int thread_group = theadidx_x * WBITS;
+  const int group_row_n = row_n * WBITS;
+  const int max_num_in_bits = (1 << WBITS) - 1;
+  const int col_ind = (tid % row_n);
+  const int compress_group_size = 32;
+  const int fp16_weight_in_row = tid / row_n * compress_group_size;
+  half scale_v[4];
+  const int scale_zero_from = fp16_weight_in_row / group_size;
+  const int scale_zero_to = (fp16_weight_in_row + compress_group_size) / group_size;
 
-      // decompress zeros
-      uint8_t zv1[4] = {0, 0, 0, 0};
-      const int zero_col_from = col_ind * WBITS / 32;
-      const int zero_col_to = (col_ind + 1) * WBITS / 32;
-      const int qzero_width = (row_n * WBITS + 32 - 1) / 32;
-      for (int i = 0, scale_zero_from_i = scale_zero_from; scale_zero_from_i <= scale_zero_to; scale_zero_from_i++, i++) {
-        uint32_t zero_v = zeros[scale_zero_from_i * qzero_width + zero_col_from];
-        const int zero_bits_last = (((col_ind)*WBITS) % 32);
-        zv1[i] = (zero_v >> zero_bits_last)& max_num_in_bits;
-        if (zero_col_from != zero_col_to) {
-          const int zero_bits_first = ((col_ind + 1) * WBITS) % 32;
-          uint32_t zero_v1 = zeros[scale_zero_from * qzero_width + zero_col_to];
-          zv1[i] |= zero_v1& ((1 << zero_bits_first) - 1);
-        }
-      }
+  // decompress scales
+  for (int i = 0, scale_zero_from_i = scale_zero_from; scale_zero_from_i <= scale_zero_to; scale_zero_from_i++, i++) {
+    scale_v[i] = scale[scale_zero_from_i * row_n + col_ind];
+  }
 
-      half scale_zeros[4];
-      for (int i = 0; i <= scale_zero_to - scale_zero_from; i++) {
-        scale_zeros[i] = __hmul(__short2half_rn(zv1[i]), scale_v[i]);
-      }
-      half2 scale_2 = __halves2half2(scale_v[0], scale_v[0]);
-      half2 scale_zeros_2 = __halves2half2(scale_zeros[0], scale_zeros[0]);
-      const uint32_t* qweight_thread = qweight_shared + WBITS * theadidx_x;
-#pragma unroll
-      for (int i = 0; i < compress_group_size/2; i++) {
-        uint8_t wv1 = 0;
-        uint8_t wv2 = 0;
-        wv1 = iterator_qweight<WBITS>(qweight_thread, i);
-        wv2 = iterator_qweight<WBITS>(qweight_thread, 16 + i);
-
-        half2 wv = __halves2half2(__short2half_rn(wv1), __short2half_rn(wv2));
-        if (group_size<32){
-          half2 scale_2 = __halves2half2(scale_v[i / group_size], scale_v[(i + 16) / group_size]);
-          half2 scale_zeros_2 = __halves2half2(scale_zeros[i / group_size], scale_zeros[(i + 16) / group_size]);
-        }
-        half2 res = __hfma2(wv, scale_2, scale_zeros_2, -1);
-        out[((fp16_weight_in_row + i) * row_n + col_ind)] = res.x;
-        out[((fp16_weight_in_row + i+16) * row_n + col_ind)] = res.y;
-      }
+  // decompress zeros
+  uint8_t zv1[4] = {0, 0, 0, 0};
+  const int zero_col_from = col_ind * WBITS / 32;
+  const int zero_col_to = (col_ind + 1) * WBITS / 32;
+  const int qzero_width = (row_n * WBITS + 32 - 1) / 32;
+  for (int i = 0, scale_zero_from_i = scale_zero_from; scale_zero_from_i <= scale_zero_to; scale_zero_from_i++, i++) {
+    uint32_t zero_v = zeros[scale_zero_from_i * qzero_width + zero_col_from];
+    const int zero_bits_last = (((col_ind)*WBITS) % 32);
+    zv1[i] = (zero_v >> zero_bits_last) & max_num_in_bits;
+    if (zero_col_from != zero_col_to) {
+      const int zero_bits_first = ((col_ind + 1) * WBITS) % 32;
+      uint32_t zero_v1 = zeros[scale_zero_from * qzero_width + zero_col_to];
+      zv1[i] |= zero_v1 & ((1 << zero_bits_first) - 1);
     }
   }
+
+  half scale_zeros[4];
+  for (int i = 0; i <= scale_zero_to - scale_zero_from; i++) {
+    scale_zeros[i] = __hmul(__short2half_rn(zv1[i]), scale_v[i]);
+  }
+  half2 scale_2 = __halves2half2(scale_v[0], scale_v[0]);
+  half2 scale_zeros_2 = __halves2half2(scale_zeros[0], scale_zeros[0]);
+  const uint32_t* qweight_thread = qweight_shared + WBITS * theadidx_x;
+#pragma unroll
+  for (int i = 0; i < compress_group_size / 2; i++) {
+    uint8_t wv1 = 0;
+    uint8_t wv2 = 0;
+    wv1 = iterator_qweight<WBITS>(qweight_thread, i);
+    wv2 = iterator_qweight<WBITS>(qweight_thread, 16 + i);
+
+    half2 wv = __halves2half2(__short2half_rn(wv1), __short2half_rn(wv2));
+    if (group_size < 32) {
+      half2 scale_2 = __halves2half2(scale_v[i / group_size], scale_v[(i + 16) / group_size]);
+      half2 scale_zeros_2 = __halves2half2(scale_zeros[i / group_size], scale_zeros[(i + 16) / group_size]);
+    }
+    half2 res = __hfma2(wv, scale_2, scale_zeros_2, -1);
+    out[((fp16_weight_in_row + i) * row_n + col_ind)] = res.x;
+    out[((fp16_weight_in_row + i + 16) * row_n + col_ind)] = res.y;
+  }
+    }
+  }
+}
+
+template <typename T, int WBITS>
+__device__ __forceinline__ uchar2 iterator_qweight_v2(const T* ptr, int idx) {
+  int start_bits = idx * WBITS;
+  int first = start_bits / 32;
+  int end_bits = (start_bits + WBITS);
+  int second = end_bits / 32;
+  start_bits = start_bits % 32;
+  end_bits = end_bits % 32;
+  uchar2 res;
+  if (first == second) {
+    res.x = (ptr[first].x >> (start_bits)) & ((1 << WBITS) - 1);
+    res.y = (ptr[first].y >> (start_bits)) & ((1 << WBITS) - 1);
+    return res;
+  } else {
+    res.x = (ptr[first].x >> (start_bits));
+    res.y = (ptr[first].y >> (start_bits));
+
+    res.x |= (ptr[second].x) & ((1 << (end_bits)) - 1);
+    res.y |= (ptr[second].y) & ((1 << (end_bits)) - 1);
+    return res;
+  }
+}
+
+template <typename T, int WBITS>
+__global__ void DequantizeAndUnpackWeight3567_v2(T* out, const uint32_t* qweight, const T* scale, const uint32_t* zeros, int group_size, const int qweight_rows, const int row_n) {
+  for (int bid = 0; bid < ((MATRIX_N/2 * MATRIX_K + 31) / 32 + kBlockSize - 1) / kBlockSize; bid++) {
+    __shared__ uint2 qweight_shared[WBITS * kBlockSize];
+    const int half_n = row_n / 2;
+
+    for (int tid = bid * kBlockSize; tid < (bid + 1) * kBlockSize; tid++) {
+      const int group_row_n = half_n * WBITS;
+      int total_qw = qweight_rows * half_n;
+
+      if (tid * WBITS >= total_qw) {
+        return;
+      }
+      int theadidx_x = tid - kBlockSize * bid;
+      uint2* qweight_thread = qweight_shared + WBITS * theadidx_x;
+
+      int qweight_start = tid / half_n * group_row_n + tid % half_n;
+      const uint2* qweigh2 = (const uint2*)qweight;
+    #pragma unroll
+      for (int j = 0; j < WBITS; j++) {
+        int ind = qweight_start + half_n * j;
+        qweight_thread[j] = ind < total_qw ? (qweigh2[ind]) : uint2();
+      }
+  }
+  for (int tid = bid * kBlockSize; tid < (bid + 1) * kBlockSize; tid++) {
+  int theadidx_x = tid - kBlockSize * bid;
+
+  uint2* qweight_thread = qweight_shared + WBITS * theadidx_x;
+
+  const int group_row_n = half_n * WBITS;
+  const int max_num_in_bits = (1 << WBITS) - 1;
+  const int col_ind = (tid % half_n);
+  const int compress_group_size = 32;
+  const int fp16_weight_in_row = tid / half_n * compress_group_size;
+  half2 scale_v[4];
+  const int scale_zero_from = fp16_weight_in_row / group_size;
+  const int scale_zero_to = (fp16_weight_in_row + compress_group_size) / group_size;
+
+  // decompress scales
+  const half2* scale2 = reinterpret_cast<const half2*>(scale);
+  for (int i = 0, scale_zero_from_i = scale_zero_from; scale_zero_from_i <= scale_zero_to; scale_zero_from_i++, i++) {
+    scale_v[i] = (scale2[scale_zero_from_i * half_n + col_ind]);
+  }
+
+  // decompress zeros
+  uchar2 zv1[4];
+  int half_col_ind = col_ind * 2;
+  const int zero_col_from = half_col_ind * WBITS / 32;
+  const int zero_col_to = ((half_col_ind + 1) * WBITS-1) / 32;
+  const int zero_col_to_2 = ((half_col_ind + 2) * WBITS-1) / 32;
+  const int qzero_width = (row_n * WBITS + 32 - 1) / 32;
+  for (int i = 0, scale_zero_from_i = scale_zero_from; scale_zero_from_i <= scale_zero_to; scale_zero_from_i++, i++) {
+    uint32_t zero_v = zeros[scale_zero_from_i * qzero_width + zero_col_from];
+    const int zero_bits_last = (((half_col_ind)*WBITS) % 32);
+    zv1[i].x = (zero_v >> zero_bits_last) & max_num_in_bits;
+    if (zero_col_from != zero_col_to) {
+      const int zero_bits_first = ((half_col_ind + 1) * WBITS) % 32;
+      uint32_t zero_v1 = zeros[scale_zero_from * qzero_width + zero_col_to];
+      zv1[i].x |= zero_v1 & ((1 << zero_bits_first) - 1);
+
+      zv1[i].y = (zero_v1 >> zero_bits_first) & max_num_in_bits;
+    } else {
+      zv1[i].y = (zero_v >> (zero_bits_last + WBITS)) & max_num_in_bits;
+    }
+
+    if (zero_col_from != zero_col_to_2) {
+      const int zero_bits_first = ((col_ind + 2) * WBITS) % 32;
+      uint32_t zero_v1 = zeros[scale_zero_from * qzero_width + zero_col_to_2];
+      zv1[i].y |= zero_v1 & ((1 << zero_bits_first) - 1);
+    }
+  }
+
+  half2 scale_zeros[4];
+  for (int i = 0; i <= scale_zero_to - scale_zero_from; i++) {
+    scale_zeros[i] = __hmul2(__halves2half2(__ushort2half_rn(zv1[i].x), __ushort2half_rn(zv1[i].y)), scale_v[i]);
+  }
+  half2 scale_2 = scale_v[0];
+  half2 scale_zeros_2 = scale_zeros[0];
+
+  const int out_offset = ((fp16_weight_in_row)*half_n + col_ind);
+  half2* out_h2 = reinterpret_cast<half2*>(out);
+
+#pragma unroll
+  for (int i = 0; i < compress_group_size / 2; i++) {
+    uchar2 wv1 = iterator_qweight_v2<uint2, WBITS>(qweight_thread, i);
+    uchar2 wv2 = iterator_qweight_v2<uint2, WBITS>(qweight_thread, 16 + i);
+
+    half2 wv = __halves2half2(__ushort2half_rn(wv1.x), __ushort2half_rn(wv1.y));
+    if (group_size < 32) {
+      half2 scale_2 = scale_v[i / group_size];
+      half2 scale_zeros_2 = scale_zeros[i / group_size];
+    }
+    half2 res = __hfma2(wv, scale_2, scale_zeros_2, -1);
+    out_h2[out_offset + i * half_n] = res;
+
+    // if (bid == 0 && threadIdx.x == 1 && i == 1) {
+    //   printf("%d,%d,%d,%d,%d,%f,%f\n", col_ind, int(wv1), int(wv2), row_n, col_ind, __half2float(wv.x), __half2float(wv.y));
+    // }
+    wv = __halves2half2(__ushort2half_rn(wv2.x), __ushort2half_rn(wv2.y));
+    if (group_size < 32) {
+      half2 scale_2 = scale_v[(i + 16) / group_size];
+      half2 scale_zeros_2 = scale_zeros[(i + 16) / group_size];
+    }
+    res = __hfma2(wv, scale_2, scale_zeros_2, -1);
+    out_h2[(out_offset + (i + 16) * half_n)] = res;
+  }
+    }
+  }
+}
+
+long long current_timestamp() {
+  struct timeval te;
+  gettimeofday(&te, NULL);                                          // get current time
+  long long milliseconds = te.tv_sec * 1000LL + te.tv_usec / 1000;  // calculate milliseconds
+  // printf("milliseconds: %lld\n", milliseconds);
+  return milliseconds;
 }
 
 void cpu_gemv_wrapper(ushort* out, ushort* Tweight_unpack, ushort* inA,
@@ -506,11 +660,15 @@ void cpu_gemv_wrapper(ushort* out, ushort* Tweight_unpack, ushort* inA,
   // cpu_gemv<ushort>(out, Tweight_unpack, inA, inB, scales, qzeros, groupsize);
   cpu_gemv_NT<ushort>(out, inA, inB, scales, qzeros, groupsize);
 }
-void dq_wrapper(ushort* out, ushort* out_ref,uint32_t* inA, ushort* scales, uint32_t* qzeros,
+void dq_wrapper(ushort* out, ushort* out_ref, uint32_t* inA, ushort* scales, uint32_t* qzeros,
                 int32_t groupsize) {
+  uint64_t start = current_timestamp();
   // cpu_gemv<ushort>(out, Tweight_unpack, inA, inB, scales, qzeros, groupsize);
-  DequantizeAndUnpackWeight248<ushort, 4>(out, inA, scales, qzeros, groupsize, MATRIX_K / 8, MATRIX_N);
-  DequantizeAndUnpackWeight3567<ushort, 4>(out, inA, scales, qzeros, groupsize, (MATRIX_K * 5 + 31) / 32, MATRIX_N);
+  //DequantizeAndUnpackWeight248<ushort, 4>(out, inA, scales, qzeros, groupsize, MATRIX_K / 8, MATRIX_N);
+  uint64_t cost = current_timestamp() - start;
+  start = current_timestamp();
+  DequantizeAndUnpackWeight3567_v2<ushort, 4>(out, inA, scales, qzeros, groupsize, (MATRIX_K * 4 + 31) / 32, MATRIX_N);
+  cost = current_timestamp() - start;
   for (int i = 0; i < MATRIX_K * MATRIX_N; i++) {
     float a=half_to_float(out_ref[i]);
     float diff = (half_to_float(out_ref[i]) - half_to_float(out[i]));
