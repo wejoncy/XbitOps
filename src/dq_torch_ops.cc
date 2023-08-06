@@ -1,5 +1,6 @@
 #include <torch/extension.h>
 #include <cstdint>
+#include <cuda_runtime.h>
 
 #define CHECK_CUDA(x) TORCH_CHECK(x.device().is_cuda(), #x " must be a CUDA tensor")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
@@ -22,7 +23,7 @@ torch::Tensor dequant_any_bit(const torch::Tensor& qweight, const torch::Tensor&
   TORCH_CHECK(groupsize >= 16, "groupsize must be >= 16");
   TORCH_CHECK(bits >= 1 && bits <= 8, "bits must be >= 1 and <= 8");
   TORCH_CHECK((in_features * bits + 31) / 32 == qweight.size(0), "in_features must be >= 1");
-
+  cudaSetDevice(qweight.device().index());
   at::Tensor output = at::zeros({in_features, qweight.size(1)}, scales.options());
   lauch_deqantize_cuda_pt_kernel(output, qweight, scales, qzeros, bits, groupsize, in_features, qweight.size(1));
   return output;
