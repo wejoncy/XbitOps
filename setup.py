@@ -14,16 +14,17 @@ NVCC_FLAGS = ["-O2", "-std=c++17"]
 ABI = 1 if torch._C._GLIBCXX_USE_CXX11_ABI else 0
 CXX_FLAGS += [f"-D_GLIBCXX_USE_CXX11_ABI={ABI}"]
 NVCC_FLAGS += [f"-D_GLIBCXX_USE_CXX11_ABI={ABI}",
-                "-U__CUDA_NO_HALF_OPERATORS__",
-                "-U__CUDA_NO_HALF_CONVERSIONS__",
-                "-U__CUDA_NO_HALF2_OPERATORS__",
-                "-D__use_torch__",
-                "--expt-relaxed-constexpr",
-                "--expt-extended-lambda",]
+               "-U__CUDA_NO_HALF_OPERATORS__",
+               "-U__CUDA_NO_HALF_CONVERSIONS__",
+               "-U__CUDA_NO_HALF2_OPERATORS__",
+               "-D__use_torch__",
+               "--expt-relaxed-constexpr",
+               "--expt-extended-lambda",]
 
 if CUDA_HOME is None:
     raise RuntimeError(
         f"Cannot find CUDA_HOME. CUDA must be available in order to build the package.")
+
 
 def get_nvcc_cuda_version(cuda_dir: str) -> Version:
     """Get the CUDA version from nvcc.
@@ -37,6 +38,7 @@ def get_nvcc_cuda_version(cuda_dir: str) -> Version:
     nvcc_cuda_version = parse(output[release_idx].split(",")[0])
     return nvcc_cuda_version
 
+
 def check_compatability(compute_capabilities: Set[int]) -> None:
     # Collect the compute capabilities of all available GPUs.
     device_count = torch.cuda.device_count()
@@ -49,6 +51,7 @@ def check_compatability(compute_capabilities: Set[int]) -> None:
     # If no GPU is available, add all supported compute capabilities.
     if not compute_capabilities:
         compute_capabilities.extend((70, 75, 80, 86, 90))
+
 
 compute_capabilities: Set[int] = set()
 check_compatability(compute_capabilities)
@@ -72,22 +75,26 @@ if 90 in compute_capabilities and nvcc_cuda_version < Version("11.8"):
 if nvcc_cuda_version >= Version("11.2"):
     num_threads = min(os.cpu_count(), 8)
     NVCC_FLAGS += ["--threads", str(num_threads)]
-    
+
 ext_modules = []
 # dq operations.
 include_dirs = os.path.dirname(os.path.abspath(__file__))+'/src'
 working_dirs = os.path.dirname(os.path.abspath(__file__))
 
-source_file = [os.path.join(working_dirs, 'src/dq_torch_ops.cc'),
-                os.path.join(working_dirs, 'src/cu/unpack_weight_2_to_7.cu')]
+source_file = [
+    os.path.join(working_dirs, 'src/dq_torch_ops.cc'),
+    os.path.join(working_dirs, 'src/cu/gemv_w4a16_pt.cu'),
+    os.path.join(working_dirs, 'src/cu/unpack_weight_2_to_7.cu')]
 
 dq_extension = CUDAExtension(
-    name="dequantize_nbit_ops",
+    name="XbitOps",
     sources=source_file,
     include_dirs=[include_dirs],
     extra_compile_args={"cxx": CXX_FLAGS, "nvcc": NVCC_FLAGS},
 )
 ext_modules.append(dq_extension)
+
+
 def get_requirements() -> List[str]:
     return [""]
     """Get Python package dependencies from requirements.txt."""
@@ -97,7 +104,7 @@ def get_requirements() -> List[str]:
 
 
 setuptools.setup(
-    name="dequantize_nbit_ops",
+    name="XbitOps",
     version="0.1",
     author="ms",
     license="Apache 2.0",
