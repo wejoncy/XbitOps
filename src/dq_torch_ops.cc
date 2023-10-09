@@ -48,11 +48,13 @@ torch::Tensor op_gemv(const torch::Tensor& input_a, const torch::Tensor& qweight
   TORCH_CHECK((in_features * bits + 31) / 32 == qweight.size(0), "in_features must be >= 1");
   TORCH_CHECK(qweight.device().index() == input_a.device().index(), "input and weight must be on the same device");
   cudaSetDevice(qweight.device().index());
-  at::Tensor output = at::zeros({in_features, qweight.size(1)}, scales.options());
+  std::vector<int64_t> outputshape ={input_a.size(0), qweight.size(1)};
   uint32_t mat_m = input_a.size(0);
   if (input_a.dim() > 2) {
+    outputshape.insert(outputshape.begin()+1, input_a.size(1));
     mat_m *= input_a.size(1);
   }
+  at::Tensor output = at::zeros(outputshape, scales.options());
   lauch_Gemv_kernel(output, input_a, qweight, scales, qzeros, bits, groupsize, mat_m, in_features, qweight.size(1));
   return output;
 }
