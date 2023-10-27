@@ -1,4 +1,5 @@
 import os
+import io
 from packaging.version import parse, Version
 from typing import List, Set
 import subprocess
@@ -6,6 +7,11 @@ import setuptools
 
 import torch
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CUDA_HOME
+ROOT_DIR = os.path.dirname(__file__)
+
+
+def get_path(*filepath) -> str:
+    return os.path.join(ROOT_DIR, *filepath)
 
 # Compiler flags.
 CXX_FLAGS = ["-g", "-O2", "-std=c++17"]
@@ -41,7 +47,7 @@ def get_nvcc_cuda_version(cuda_dir: str) -> Version:
 
 def check_compatability(compute_capabilities: Set[int]) -> None:
     if os.getenv("CUDA_ARCH", "") == "ALL":
-        compute_capabilities = set([70, 75, 80, 86, 90])
+        compute_capabilities = set([70, 75, 80, 86, 89, 90])
         return 
     # Collect the compute capabilities of all available GPUs.
     device_count = torch.cuda.device_count()
