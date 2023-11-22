@@ -32,7 +32,7 @@ __device__ __forceinline__ float warpReduceSum(float sum) {
 }
 
 template <typename T>
-__global__ void gemv(T* out, const T* inA, const uint32_t* inB, const T* scales, const uint32_t* qzeros, int32_t groupsize, int32_t size_k, int32_t size_n) {
+__global__ void gemv(T* out, const T* inA, const uint32_t* inB, const T* scales, const uint32_t* qzeros, int32_t groupsize, int32_t size_k, int32_t size_n, uint8_t add_zero_bias) {
   int bid = blockIdx.x;
   //__shared__ T vecA[size_k];
   __shared__ float bsum[2][32][32 + 1];
@@ -82,18 +82,18 @@ __global__ void gemv(T* out, const T* inA, const uint32_t* inB, const T* scales,
       // vb[j + 4] = __halves2half2(__int2half_rn(((vbInt2)>>(j*8)) & 0xF),
       //                            __int2half_rn((((vbInt2) >> (j*8+4))) &
       //                            0xF));
-      vb[j] = __halves2half2(__int2half_rn(((*(qweight_p1 + j))) & 0xF),
-                             __int2half_rn(((*(qweight_p1 + j)) >> 4) & 0xF));
+      vb[j] = __halves2half2(__int2half_rn((((*(qweight_p1 + j))) & 0xF) + add_zero_bias),
+                             __int2half_rn((((*(qweight_p1 + j)) >> 4) & 0xF) + add_zero_bias));
       vb[j + 4] =
-          __halves2half2(__int2half_rn(((*(qweight_p2 + j))) & 0xF),
-                         __int2half_rn((((*(qweight_p2 + j)) >> 4)) & 0xF));
+          __halves2half2(__int2half_rn(((*(qweight_p2 + j)) & 0xF) + add_zero_bias),
+                         __int2half_rn((((*(qweight_p2 + j)) >> 4) & 0xF) + add_zero_bias));
     }
 
     if (g_id > start_group_id) {
       scale = ((const half2*)(scales + g_id * size_n + n_offset_x))[0];
       qzero_p = ((const int32_t*)(qzeros + n_offset_x / 8 + g_id * ((size_n + 7) / 8)))[0];
-      hzero = __halves2half2(__int2half_rn((qzero_p >> (8 * (compressed_idx))) & 0xf),
-                             __int2half_rn(((qzero_p) >> (8 * (compressed_idx) + 4)) & 0xf));
+      hzero = __halves2half2(__int2half_rn(((qzero_p >> (8 * (compressed_idx))) & 0xf) + add_zero_bias),
+                             __int2half_rn((((qzero_p) >> (8 * (compressed_idx) + 4)) & 0xf) + add_zero_bias));
       scale_h0 = __half2half2(scale.x);
       scale_h1 = __half2half2(scale.y);
       hzero_scale_0 = __half2half2(hzero.x * scale.x);
@@ -143,7 +143,7 @@ __global__ void gemv(T* out, const T* inA, const uint32_t* inB, const T* scales,
 
 void lauch_Gemv_kernel(torch::Tensor& out_fp16, const torch::Tensor& a_fp16, const torch::Tensor& qweight_i32,
                        const torch::Tensor& scale_fp16, const torch::Tensor& qzeros_i32,
-                       int bits, int groupsize, uint32_t mat_m, uint32_t mat_k, uint32_t mat_n) {
+                       int bits, int groupsize, uint32_t mat_m, uint32_t mat_k, uint32_t mat_n, int add_zero_bias) {
   if (bits != 4 || groupsize != 128) {
     printf("only support 4bit quantization, and groupsize must be 128\n");
     abort();
@@ -159,7 +159,7 @@ void lauch_Gemv_kernel(torch::Tensor& out_fp16, const torch::Tensor& a_fp16, con
                                         (const uint32_t*)(qweight_i32.data_ptr<int32_t>()),
                                         scale_fp16.data_ptr<scalar_t>(),
                                         (const uint32_t*)(qzeros_i32.data_ptr<int32_t>()),
-                                        groupsize, mat_k, mat_n);
+                                        groupsize, mat_k, mat_n, add_zero_bias);
   cudaError_t err = cudaGetLastError();
   if (cudaSuccess != err) {
     fprintf(stderr, "cudaCheckError() failed : %s\n", cudaGetErrorString(err));

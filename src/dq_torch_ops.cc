@@ -10,18 +10,18 @@
 
 void lauch_deqantize_cuda_pt_kernel(torch::Tensor& b_fp16, const torch::Tensor& qweight_i32,
                                     const torch::Tensor& scale_fp16, const torch::Tensor& qzeros_i32,
-                                    int bits, int groupsize, uint32_t mat_k, uint32_t mat_n);
+                                    int bits, int groupsize, uint32_t mat_k, uint32_t mat_n, uint8_t add_zero_bias);
 
 void lauch_Gemv_kernel(torch::Tensor& out_fp16, const torch::Tensor& a_fp16, const torch::Tensor& qweight_i32,
                        const torch::Tensor& scale_fp16, const torch::Tensor& qzeros_i32,
-                       int bits, int groupsize, uint32_t mat_m, uint32_t mat_k, uint32_t mat_n);
+                       int bits, int groupsize, uint32_t mat_m, uint32_t mat_k, uint32_t mat_n, uint8_t add_zero_bias);
 
 int MATRIX_M = 0;
 int MATRIX_K = 0;
 int MATRIX_N = 0;
 
 torch::Tensor dequant_any_bit(const torch::Tensor& qweight, const torch::Tensor& scales,
-                              const torch::Tensor& qzeros, int groupsize, int bits, int in_features) {
+                              const torch::Tensor& qzeros, int groupsize, int bits, int in_features, uint8_t add_zero_bias) {
   CHECK_INPUT(qweight);
   CHECK_INPUT(scales);
   CHECK_INPUT(qzeros);
@@ -31,13 +31,13 @@ torch::Tensor dequant_any_bit(const torch::Tensor& qweight, const torch::Tensor&
   TORCH_CHECK((in_features * bits + 31) / 32 == qweight.size(0), "in_features must be >= 1");
   cudaSetDevice(qweight.device().index());
   at::Tensor output = at::zeros({in_features, qweight.size(1)}, scales.options());
-  lauch_deqantize_cuda_pt_kernel(output, qweight, scales, qzeros, bits, groupsize, in_features, qweight.size(1));
+  lauch_deqantize_cuda_pt_kernel(output, qweight, scales, qzeros, bits, groupsize, in_features, qweight.size(1), add_zero_bias);
   return output;
 }
 
 torch::Tensor op_gemv(const torch::Tensor& input_a, const torch::Tensor& qweight,
                       const torch::Tensor& scales, const torch::Tensor& qzeros,
-                      int groupsize, int bits, int in_features) {
+                      int groupsize, int bits, int in_features, uint8_t add_zero_bias) {
   CHECK_INPUT(input_a);
   CHECK_INPUT(qweight);
   CHECK_INPUT(scales);
@@ -55,7 +55,7 @@ torch::Tensor op_gemv(const torch::Tensor& input_a, const torch::Tensor& qweight
     mat_m *= input_a.size(1);
   }
   at::Tensor output = at::zeros(outputshape, scales.options());
-  lauch_Gemv_kernel(output, input_a, qweight, scales, qzeros, bits, groupsize, mat_m, in_features, qweight.size(1));
+  lauch_Gemv_kernel(output, input_a, qweight, scales, qzeros, bits, groupsize, mat_m, in_features, qweight.size(1), add_zero_bias);
   return output;
 }
 
