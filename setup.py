@@ -117,7 +117,7 @@ def read_readme() -> str:
 
 setuptools.setup(
     name="XbitOps",
-    version="0.1.1",
+    version="0.1.2",
     author="wejoncy",
     license="Apache 2.0",
     description="A high-efficient dequantization method for n-bit GPTQ",

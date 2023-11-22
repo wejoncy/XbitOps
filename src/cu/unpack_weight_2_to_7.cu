@@ -56,7 +56,7 @@ namespace cuda_quant {
 #define FETCH_HALF2(pointer) (reinterpret_cast<half2*>(&(pointer))[0])
 
 template <typename T, int WBITS>
-__global__ void DequantizeAndUnpackWeight248(T* out, uint32_t* qweight, T* scale, uint32_t* zeros, int group_size, const int in_features, const int n) {
+__global__ void DequantizeAndUnpackWeight248(T* out, uint32_t* qweight, T* scale, uint32_t* zeros, int group_size, const int in_features, const int n, uint8_t add_zero_bias) {
   int bid = blockIdx.x;
   int tid = (bid * kBlockSize + threadIdx.x);
   const int qweight_rows = (in_features * WBITS + 31) / 32;
@@ -82,20 +82,20 @@ __global__ void DequantizeAndUnpackWeight248(T* out, uint32_t* qweight, T* scale
   if (remains >= compress_group_size) {
 #pragma unroll
     for (int i = 0; i < compress_group_size; i++) {
-      uint8_t wv1 = (weight_v1 >> (i * WBITS)) & max_num_in_bits;
-      uint8_t wv2 = (weight_v2 >> (i * WBITS)) & max_num_in_bits;
+      uint8_t wv1 = ((weight_v1 >> (i * WBITS)) & max_num_in_bits)+add_zero_bias;
+      uint8_t wv2 = ((weight_v2 >> (i * WBITS)) & max_num_in_bits)+add_zero_bias;
       half2 wv = __halves2half2(__short2half_rn(wv1), __short2half_rn(wv2));
       out_h2[((weight_in_row + i) * n + col_ind) / 2] = __hfma2(wv, scale_v, -scale_zeros);
     }
   } else {
     for (int i = 0; i < remains; i++) {
-      uint8_t wv1 = (weight_v1 >> (i * WBITS)) & max_num_in_bits;
-      uint8_t wv2 = (weight_v2 >> (i * WBITS)) & max_num_in_bits;
+      uint8_t wv1 = ((weight_v1 >> (i * WBITS)) & max_num_in_bits)+add_zero_bias;
+      uint8_t wv2 = ((weight_v2 >> (i * WBITS)) & max_num_in_bits)+add_zero_bias;
       half2 wv = __halves2half2(__short2half_rn(wv1), __short2half_rn(wv2));
       out_h2[((weight_in_row + i) * n + col_ind) / 2] = __hfma2(wv, scale_v, -scale_zeros);
     }
   }
-  }
+}
 
 template <int WBITS>
 __device__ __forceinline__ uint8_t iterator_qweight(const uint32_t* ptr, int idx) {
@@ -115,7 +115,7 @@ __device__ __forceinline__ uint8_t iterator_qweight(const uint32_t* ptr, int idx
 }
 
 template <typename T, int WBITS>
-__global__ void DequantizeAndUnpackWeight3567(T* out, uint32_t* qweight, T* scale, uint32_t* zeros, int group_size, const int in_features, const int row_n) {
+__global__ void DequantizeAndUnpackWeight3567(T* out, uint32_t* qweight, T* scale, uint32_t* zeros, int group_size, const int in_features, const int row_n, uint8_t add_zero_bias) {
   int bid = blockIdx.x;
   int tid = (bid * kBlockSize + threadIdx.x);
   __shared__ uint32_t qweight_shared[WBITS * kBlockSize];
@@ -175,8 +175,8 @@ __global__ void DequantizeAndUnpackWeight3567(T* out, uint32_t* qweight, T* scal
   for (int i = 0; i < compress_group_size / 2; i++) {
     uint8_t wv1 = 0;
     uint8_t wv2 = 0;
-    wv1 = iterator_qweight<WBITS>(qweight_thread, i);
-    wv2 = iterator_qweight<WBITS>(qweight_thread, 16 + i);
+    wv1 = iterator_qweight<WBITS>(qweight_thread, i)+add_zero_bias;
+    wv2 = iterator_qweight<WBITS>(qweight_thread, 16 + i)+add_zero_bias;
 
     half2 wv = __halves2half2(__short2half_rn(wv1), __short2half_rn(wv2));
     if (group_size < 32) {
@@ -193,7 +193,7 @@ __global__ void DequantizeAndUnpackWeight3567(T* out, uint32_t* qweight, T* scal
   } else {
     // decompress weights
     for (int i = 0; i < remains; i++) {
-      uint8_t wv1 = iterator_qweight<WBITS>(qweight_thread, i);
+      uint8_t wv1 = iterator_qweight<WBITS>(qweight_thread, i)+add_zero_bias;
       T wv = __short2half_rn(wv1);
       if (group_size < 32) {
         scale_2.x = scale_v[i / group_size];
@@ -229,7 +229,7 @@ __device__ __forceinline__ uchar2 iterator_qweight_v2(const T* ptr, int idx) {
 }
 
 template <typename T, int WBITS>
-__global__ void DequantizeAndUnpackWeight3567_v2(T* out, const uint32_t* qweight, const T* scale, const uint32_t* zeros, int group_size, const int in_features, const int row_n) {
+__global__ void DequantizeAndUnpackWeight3567_v2(T* out, const uint32_t* qweight, const T* scale, const uint32_t* zeros, int group_size, const int in_features, const int row_n, uint8_t add_zero_bias) {
   int bid = blockIdx.x;
   int tid = (bid * kBlockSize + threadIdx.x);
   const int qweight_rows = (in_features * WBITS + 31) / 32;
@@ -308,7 +308,7 @@ __global__ void DequantizeAndUnpackWeight3567_v2(T* out, const uint32_t* qweight
     uchar2 wv1= iterator_qweight_v2<uint2, WBITS>(qweight_thread, i);
     uchar2 wv2 = iterator_qweight_v2<uint2, WBITS>(qweight_thread, 16 + i);
 
-    half2 wv = __halves2half2(__ushort2half_rn(wv1.x), __ushort2half_rn(wv1.y));
+    half2 wv = __halves2half2(__ushort2half_rn(wv1.x + add_zero_bias), __ushort2half_rn(wv1.y + add_zero_bias));
     if (group_size < 32) {
       half2 scale_2 = scale_v[i / group_size];
       half2 scale_zeros_2 = scale_zeros[i / group_size];
@@ -316,7 +316,7 @@ __global__ void DequantizeAndUnpackWeight3567_v2(T* out, const uint32_t* qweight
     half2 res = __hfma2(wv, scale_2, -scale_zeros_2);
     out_h2[out_offset + i * half_n] = res;
 
-    wv = __halves2half2(__ushort2half_rn(wv2.x), __ushort2half_rn(wv2.y));
+    wv = __halves2half2(__ushort2half_rn(wv2.x + add_zero_bias), __ushort2half_rn(wv2.y + add_zero_bias));
     if (group_size < 32) {
       half2 scale_2 = scale_v[(i + 16) / group_size];
       half2 scale_zeros_2 = scale_zeros[(i + 16) / group_size];
@@ -329,7 +329,7 @@ __global__ void DequantizeAndUnpackWeight3567_v2(T* out, const uint32_t* qweight
     for (int i = 0; i < remains; i++) {
       uchar2 wv1 = iterator_qweight_v2<uint2, WBITS>(qweight_thread, i);
 
-      half2 wv = __halves2half2(__ushort2half_rn(wv1.x), __ushort2half_rn(wv1.y));
+      half2 wv = __halves2half2(__ushort2half_rn(wv1.x + add_zero_bias), __ushort2half_rn(wv1.y + add_zero_bias));
       if (group_size < 32) {
         scale_2 = scale_v[i / group_size];
         scale_zeros_2 = scale_zeros[i / group_size];
@@ -338,7 +338,7 @@ __global__ void DequantizeAndUnpackWeight3567_v2(T* out, const uint32_t* qweight
       out_h2[out_offset + i * half_n] = res;
     }
   }
-  }
+}
 
 __global__ void convertFp32ToFp16(half* out, float* in, int n) {
   int idx = blockDim.x * blockIdx.x + threadIdx.x;
@@ -361,7 +361,7 @@ __global__ void convertFp16ToFp32(float* out, half* in, int n) {
 #endif
 
 template <typename scalar_t>
-static void lauch_dq_248(scalar_t* b_fp16, int32_t* qweight_i32_i, scalar_t* scale_fp16, int32_t* qzeros_i32_i, int bits, int groupsize, uint32_t mat_k, uint32_t mat_n) {
+static void lauch_dq_248(scalar_t* b_fp16, int32_t* qweight_i32_i, scalar_t* scale_fp16, int32_t* qzeros_i32_i, int bits, int groupsize, uint32_t mat_k, uint32_t mat_n, uint8_t add_zero_bias = 0) {
   if constexpr (std::is_same<scalar_t, double>::value) {
     return;
   } else if constexpr (std::is_same<scalar_t, float>::value) {
@@ -380,13 +380,13 @@ static void lauch_dq_248(scalar_t* b_fp16, int32_t* qweight_i32_i, scalar_t* sca
   using cuda_quant::DequantizeAndUnpackWeight248;
   switch(bits) {
     case 2:
-      DequantizeAndUnpackWeight248<half, 2><<<gridDim, blockDim, 0, stream>>>((half*)b_fp16, qweight_i32, (half*)scale_fp16, qzeros_i32, groupsize, mat_k, mat_n);
+      DequantizeAndUnpackWeight248<half, 2><<<gridDim, blockDim, 0, stream>>>((half*)b_fp16, qweight_i32, (half*)scale_fp16, qzeros_i32, groupsize, mat_k, mat_n, add_zero_bias);
       break;
   case 4:
-      DequantizeAndUnpackWeight248<half, 4><<<gridDim, blockDim, 0, stream>>>((half*)b_fp16, qweight_i32, (half*)scale_fp16, qzeros_i32, groupsize, mat_k, mat_n);
+      DequantizeAndUnpackWeight248<half, 4><<<gridDim, blockDim, 0, stream>>>((half*)b_fp16, qweight_i32, (half*)scale_fp16, qzeros_i32, groupsize, mat_k, mat_n, add_zero_bias);
       break;
   case 8:
-      DequantizeAndUnpackWeight248<half, 8><<<gridDim, blockDim, 0, stream>>>((half*)b_fp16, qweight_i32, (half*)scale_fp16, qzeros_i32, groupsize, mat_k, mat_n);
+      DequantizeAndUnpackWeight248<half, 8><<<gridDim, blockDim, 0, stream>>>((half*)b_fp16, qweight_i32, (half*)scale_fp16, qzeros_i32, groupsize, mat_k, mat_n, add_zero_bias);
       break;
   default:
   printf("error bits\n");
@@ -395,7 +395,7 @@ static void lauch_dq_248(scalar_t* b_fp16, int32_t* qweight_i32_i, scalar_t* sca
 }
 
 template <typename scalar_t>
-static void lauch_dq_3567(scalar_t* b_fp16, int32_t* qweight_i32_i, scalar_t* scale_fp16, int32_t* qzeros_i32_i, int bits, int groupsize, uint32_t mat_k, uint32_t mat_n) {
+static void lauch_dq_3567(scalar_t* b_fp16, int32_t* qweight_i32_i, scalar_t* scale_fp16, int32_t* qzeros_i32_i, int bits, int groupsize, uint32_t mat_k, uint32_t mat_n, uint8_t add_zero_bias = 0) {
   if constexpr (std::is_same<scalar_t, double>::value) {
   return;
   } else if constexpr (std::is_same<scalar_t, float>::value) {
@@ -414,16 +414,16 @@ static void lauch_dq_3567(scalar_t* b_fp16, int32_t* qweight_i32_i, scalar_t* sc
   using cuda_quant::DequantizeAndUnpackWeight3567_v2;
   switch (bits) {
   case 3:
-      DequantizeAndUnpackWeight3567_v2<half, 3><<<gridDim, blockDim, 0, stream>>>((half*)b_fp16, qweight_i32, (half*)scale_fp16, qzeros_i32, groupsize, mat_k, mat_n);
+      DequantizeAndUnpackWeight3567_v2<half, 3><<<gridDim, blockDim, 0, stream>>>((half*)b_fp16, qweight_i32, (half*)scale_fp16, qzeros_i32, groupsize, mat_k, mat_n, add_zero_bias);
       break;
   case 5:
-      DequantizeAndUnpackWeight3567_v2<half, 5><<<gridDim, blockDim, 0, stream>>>((half*)b_fp16, qweight_i32, (half*)scale_fp16, qzeros_i32, groupsize, mat_k, mat_n);
+      DequantizeAndUnpackWeight3567_v2<half, 5><<<gridDim, blockDim, 0, stream>>>((half*)b_fp16, qweight_i32, (half*)scale_fp16, qzeros_i32, groupsize, mat_k, mat_n, add_zero_bias);
       break;
   case 6:
-      DequantizeAndUnpackWeight3567_v2<half, 6><<<gridDim, blockDim, 0, stream>>>((half*)b_fp16, qweight_i32, (half*)scale_fp16, qzeros_i32, groupsize, mat_k, mat_n);
+      DequantizeAndUnpackWeight3567_v2<half, 6><<<gridDim, blockDim, 0, stream>>>((half*)b_fp16, qweight_i32, (half*)scale_fp16, qzeros_i32, groupsize, mat_k, mat_n, add_zero_bias);
       break;
   case 7:
-      DequantizeAndUnpackWeight3567_v2<half, 7><<<gridDim, blockDim, 0, stream>>>((half*)b_fp16, qweight_i32, (half*)scale_fp16, qzeros_i32, groupsize, mat_k, mat_n);
+      DequantizeAndUnpackWeight3567_v2<half, 7><<<gridDim, blockDim, 0, stream>>>((half*)b_fp16, qweight_i32, (half*)scale_fp16, qzeros_i32, groupsize, mat_k, mat_n, add_zero_bias);
       break;
   default:
   printf("error bits\n");
@@ -431,18 +431,17 @@ static void lauch_dq_3567(scalar_t* b_fp16, int32_t* qweight_i32_i, scalar_t* sc
   }
 }
 
-
 #ifdef __use_torch__
 
 void lauch_deqantize_cuda_pt_kernel(torch::Tensor& b_fp16, const torch::Tensor& qweight_i32, const torch::Tensor& scale_fp16, const torch::Tensor& qzeros_i32,
-                                    int bits, int groupsize, uint32_t mat_k, uint32_t mat_n) {
+                                    int bits, int groupsize, uint32_t mat_k, uint32_t mat_n, uint8_t add_zero_bias) {
   if (bits == 2 || bits == 4 || bits == 8) {
     AT_DISPATCH_FLOATING_TYPES_AND_HALF(b_fp16.scalar_type(), "lauch_deqantize_cuda_pt_kernel", ([&] {
-      lauch_dq_248<scalar_t>(b_fp16.data_ptr<scalar_t>(), qweight_i32.data_ptr<int32_t>(), scale_fp16.data_ptr<scalar_t>(), qzeros_i32.data_ptr<int32_t>(), bits, groupsize, mat_k, mat_n);
+      lauch_dq_248<scalar_t>(b_fp16.data_ptr<scalar_t>(), qweight_i32.data_ptr<int32_t>(), scale_fp16.data_ptr<scalar_t>(), qzeros_i32.data_ptr<int32_t>(), bits, groupsize, mat_k, mat_n, add_zero_bias);
     }));
   } else {
     AT_DISPATCH_FLOATING_TYPES_AND_HALF(b_fp16.scalar_type(), "lauch_deqantize_cuda_pt_kernel", ([&] {
-      lauch_dq_3567<scalar_t>(b_fp16.data_ptr<scalar_t>(), qweight_i32.data_ptr<int32_t>(), scale_fp16.data_ptr<scalar_t>(), qzeros_i32.data_ptr<int32_t>(), bits, groupsize, mat_k, mat_n);
+      lauch_dq_3567<scalar_t>(b_fp16.data_ptr<scalar_t>(), qweight_i32.data_ptr<int32_t>(), scale_fp16.data_ptr<scalar_t>(), qzeros_i32.data_ptr<int32_t>(), bits, groupsize, mat_k, mat_n, add_zero_bias);
     }));
   }
   cudaError_t err = cudaGetLastError();
@@ -541,20 +540,20 @@ int QbitGemv(SampleData* p_sampledata) {
   printf("Running with DequantizeAndUnpackWeight...\n");
   if (sampledata.bits == 4){
   // cuda_quant::DequantizeAndUnpackWeight248<half, 4><<<gridDim, blockDim>>>(b_fp16, qweight_i32, scale_fp16, qzeros_i32, 128, MATRIX_K, MATRIX_N);
-  cuda_quant::DequantizeAndUnpackWeight3567<half, 4><<<gridDim, blockDim>>>(b_fp16, qweight_i32, scale_fp16, qzeros_i32, 128, MATRIX_K, MATRIX_N);
-  // cuda_quant::DequantizeAndUnpackWeight3567_v2<half, 5><<<gridDim, blockDim>>>(b_fp16, qweight_i32, scale_fp16, qzeros_i32, 128, MATRIX_K, MATRIX_N);
+  cuda_quant::DequantizeAndUnpackWeight3567<half, 4><<<gridDim, blockDim>>>(b_fp16, qweight_i32, scale_fp16, qzeros_i32, 128, MATRIX_K, MATRIX_N, 0);
+  // cuda_quant::DequantizeAndUnpackWeight3567_v2<half, 5><<<gridDim, blockDim>>>(b_fp16, qweight_i32, scale_fp16, qzeros_i32, 128, MATRIX_K, MATRIX_N, 0);
   } else {
-    cuda_quant::DequantizeAndUnpackWeight3567_v2<half, 5><<<gridDim, blockDim>>>(b_fp16, qweight_i32, scale_fp16, qzeros_i32, 128, MATRIX_K, MATRIX_N);
+    cuda_quant::DequantizeAndUnpackWeight3567_v2<half, 5><<<gridDim, blockDim>>>(b_fp16, qweight_i32, scale_fp16, qzeros_i32, 128, MATRIX_K, MATRIX_N, 0);
   }
 
   cudaErrCheck(cudaEventRecord(startGEMV));
   for (int i = 0; i < n_iter; i++) {
     // cuda_quant::DequantizeAndUnpackWeight3567<half, 5><<<gridDim, blockDim>>>(b_fp16, qweight_i32, scale_fp16, qzeros_i32, 128, MATRIX_K , MATRIX_N);
     if (sampledata.bits == 4) {
-      cuda_quant::DequantizeAndUnpackWeight3567_v2<half, 4><<<gridDim, blockDim>>>(b_fp16, qweight_i32, scale_fp16, qzeros_i32, 128, MATRIX_K, MATRIX_N);
+      cuda_quant::DequantizeAndUnpackWeight3567_v2<half, 4><<<gridDim, blockDim>>>(b_fp16, qweight_i32, scale_fp16, qzeros_i32, 128, MATRIX_K, MATRIX_N, 0);
     }
     else{
-      cuda_quant::DequantizeAndUnpackWeight3567_v2<half, 5><<<gridDim, blockDim>>>(b_fp16, qweight_i32, scale_fp16, qzeros_i32, 128, MATRIX_K, MATRIX_N);
+      cuda_quant::DequantizeAndUnpackWeight3567_v2<half, 5><<<gridDim, blockDim>>>(b_fp16, qweight_i32, scale_fp16, qzeros_i32, 128, MATRIX_K, MATRIX_N, 0);
     }
   // cuda_quant::DequantizeAndUnpackWeight248<half, 4><<<gridDim, blockDim>>>(b_fp16, qweight_i32, scale_fp16, qzeros_i32, 128, MATRIX_K, MATRIX_N);
   }
