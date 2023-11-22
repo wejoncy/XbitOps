@@ -143,7 +143,7 @@ __global__ void gemv(T* out, const T* inA, const uint32_t* inB, const T* scales,
 
 void lauch_Gemv_kernel(torch::Tensor& out_fp16, const torch::Tensor& a_fp16, const torch::Tensor& qweight_i32,
                        const torch::Tensor& scale_fp16, const torch::Tensor& qzeros_i32,
-                       int bits, int groupsize, uint32_t mat_m, uint32_t mat_k, uint32_t mat_n, int add_zero_bias) {
+                       int bits, int groupsize, uint32_t mat_m, uint32_t mat_k, uint32_t mat_n, uint8_t add_zero_bias) {
   if (bits != 4 || groupsize != 128) {
     printf("only support 4bit quantization, and groupsize must be 128\n");
     abort();
