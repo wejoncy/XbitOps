@@ -30,8 +30,16 @@ torch::Tensor dequant_any_bit(const torch::Tensor& qweight, const torch::Tensor&
   TORCH_CHECK(bits >= 1 && bits <= 8, "bits must be >= 1 and <= 8");
   TORCH_CHECK((in_features * bits + 31) / 32 == qweight.size(0), "in_features must be >= 1");
   cudaSetDevice(qweight.device().index());
-  at::Tensor output = at::zeros({in_features, qweight.size(1)}, scales.options());
-  lauch_deqantize_cuda_pt_kernel(output, qweight, scales, qzeros, bits, groupsize, in_features, qweight.size(1), add_zero_bias);
+  auto f16_scale = scales;
+  auto ori_dtype = scales.scalar_type();
+  if (ori_dtype == torch::kBFloat16) {
+    f16_scale = scales.to(torch::kFloat16);
+  }
+  at::Tensor output = at::zeros({in_features, qweight.size(1)}, f16_scale.options());
+  lauch_deqantize_cuda_pt_kernel(output, qweight, f16_scale, qzeros, bits, groupsize, in_features, qweight.size(1), add_zero_bias);
+  if (ori_dtype == torch::kBFloat16) {
+    output = output.to(torch::kBFloat16);
+  }
   return output;
 }
 
@@ -54,8 +62,18 @@ torch::Tensor op_gemv(const torch::Tensor& input_a, const torch::Tensor& qweight
     outputshape.insert(outputshape.begin()+1, input_a.size(1));
     mat_m *= input_a.size(1);
   }
-  at::Tensor output = at::zeros(outputshape, scales.options());
-  lauch_Gemv_kernel(output, input_a, qweight, scales, qzeros, bits, groupsize, mat_m, in_features, qweight.size(1), add_zero_bias);
+  auto f16_scale = scales;
+  auto ori_dtype = scales.scalar_type();
+  if (ori_dtype == torch::kBFloat16) {
+    f16_scale = scales.to(torch::kFloat16);
+  }
+
+  at::Tensor output = at::zeros(outputshape, f16_scale.options());
+  lauch_Gemv_kernel(output, input_a, qweight, f16_scale, qzeros, bits, groupsize, mat_m, in_features, qweight.size(1), add_zero_bias);
+
+  if (ori_dtype == torch::kBFloat16) {
+    output = output.to(torch::kBFloat16);
+  }
   return output;
 }
 

@@ -23,6 +23,7 @@ NVCC_FLAGS += [f"-D_GLIBCXX_USE_CXX11_ABI={ABI}",
                "-U__CUDA_NO_HALF_OPERATORS__",
                "-U__CUDA_NO_HALF_CONVERSIONS__",
                "-U__CUDA_NO_HALF2_OPERATORS__",
+               "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
                "-D__use_torch__",
                "--expt-relaxed-constexpr",
                "--expt-extended-lambda",]
