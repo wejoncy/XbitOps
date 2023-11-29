@@ -1,8 +1,9 @@
 #include <stdio.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cstdint>
 #include <cstdlib>
-
+#include "common.cuh"
 
 #ifdef __use_torch__
 #include <torch/extension.h>
@@ -16,25 +17,7 @@
 #include <cublas_v2.h>
 #endif
 
-// Define some error checking macros.
-#define cudaErrCheck(stat)                     \
-  {                                            \
-    cudaErrCheck_((stat), __FILE__, __LINE__); \
-  }
-void cudaErrCheck_(cudaError_t stat, const char* file, int line) {
-  if (stat != cudaSuccess) {
-    fprintf(stderr, "CUDA Error: %s %s %d\n", cudaGetErrorString(stat), file, line);
-  }
-}
-#define cublasErrCheck(stat)                     \
-  {                                              \
-    cublasErrCheck_((stat), __FILE__, __LINE__); \
-  }
-void cublasErrCheck_(cublasStatus_t stat, const char* file, int line) {
-  if (stat != CUBLAS_STATUS_SUCCESS) {
-    fprintf(stderr, "cuBLAS Error: %d %s %d\n", stat, file, line);
-  }
-}
+
 //#define curandErrCheck(stat)                     \
 //  {                                              \
 //    curandErrCheck_((stat), __FILE__, __LINE__); \
@@ -54,25 +37,29 @@ constexpr int kBlockSize = 256;
 namespace cuda_quant {
 #define FETCH_UINT2(pointer) (reinterpret_cast<uint2*>(&(pointer))[0])
 #define FETCH_HALF2(pointer) (reinterpret_cast<half2*>(&(pointer))[0])
+#define FETCH_VEC2(pointer) (reinterpret_cast<VEC2*>(&(pointer))[0])
 
-template <typename T, int WBITS>
-__global__ void DequantizeAndUnpackWeight248(T* out, uint32_t* qweight, T* scale, uint32_t* zeros, int group_size, const int in_features, const int n, uint8_t add_zero_bias) {
+
+
+template <typename scalar_t, int WBITS>
+__global__ void DequantizeAndUnpackWeight248(scalar_t* out, uint32_t* qweight, scalar_t* scale, uint32_t* zeros, int group_size, const int in_features, const int n, uint8_t add_zero_bias) {
   int bid = blockIdx.x;
   int tid = (bid * kBlockSize + threadIdx.x);
-  const int qweight_rows = (in_features * WBITS + 31) / 32;
   const int half_n = n/2;
 
+  using VEC2 = typename TYPE_VEC2<scalar_t>::Type;
   const int compress_group_size = 32 / WBITS;
   const int max_num_in_bits = (1 << WBITS) - 1;
   int col_ind = (tid % half_n)*2;
   int weight_in_row = tid / half_n * compress_group_size;
-  half2 scale_v = FETCH_HALF2(scale[weight_in_row / group_size*n + col_ind]);
+  VEC2 scale_v = FETCH_VEC2(scale[weight_in_row / group_size * n + col_ind]);
   uint32_t zero_v = zeros[weight_in_row / group_size * (n / compress_group_size) + (col_ind) / compress_group_size];
   int zero_ind = col_ind % compress_group_size;
   uint8_t zv1 = (zero_v >> (zero_ind * WBITS)) & max_num_in_bits;
   uint8_t zv2 = (zero_v >> (zero_ind * WBITS + WBITS)) & max_num_in_bits;
-  half2 scale_zeros = __hmul2(__halves2half2(__short2half_rn(zv1+add_zero_bias), __short2half_rn(zv2+add_zero_bias)), scale_v);
-  half2* out_h2 = reinterpret_cast<half2*>(out);
+  VEC2 scale_zeros = __hmul2((Short22Vec2<scalar_t>(zv1 + add_zero_bias, zv2 + add_zero_bias)),
+                             scale_v);
+  VEC2* out_h2 = reinterpret_cast<VEC2*>(out);
 
   uint2 weight_int2 = FETCH_UINT2(qweight[tid * 2]);
   uint32_t weight_v1 = weight_int2.x;
@@ -84,14 +71,14 @@ __global__ void DequantizeAndUnpackWeight248(T* out, uint32_t* qweight, T* scale
     for (int i = 0; i < compress_group_size; i++) {
       uint8_t wv1 = (weight_v1 >> (i * WBITS)) & max_num_in_bits;
       uint8_t wv2 = (weight_v2 >> (i * WBITS)) & max_num_in_bits;
-      half2 wv = __halves2half2(__short2half_rn(wv1), __short2half_rn(wv2));
+      VEC2 wv = Short22Vec2<scalar_t>(wv1, wv2);
       out_h2[((weight_in_row + i) * n + col_ind) / 2] = __hfma2(wv, scale_v, -scale_zeros);
     }
   } else {
     for (int i = 0; i < remains; i++) {
       uint8_t wv1 = (weight_v1 >> (i * WBITS)) & max_num_in_bits;
       uint8_t wv2 = (weight_v2 >> (i * WBITS)) & max_num_in_bits;
-      half2 wv = __halves2half2(__short2half_rn(wv1), __short2half_rn(wv2));
+      VEC2 wv = Short22Vec2<scalar_t>(wv1, wv2);
       out_h2[((weight_in_row + i) * n + col_ind) / 2] = __hfma2(wv, scale_v, -scale_zeros);
     }
   }
@@ -114,8 +101,8 @@ __device__ __forceinline__ uint8_t iterator_qweight(const uint32_t* ptr, int idx
   }
 }
 
-template <typename T, int WBITS>
-__global__ void DequantizeAndUnpackWeight3567(T* out, uint32_t* qweight, T* scale, uint32_t* zeros, int group_size, const int in_features, const int row_n) {
+template <typename scalar_t, int WBITS>
+__global__ void DequantizeAndUnpackWeight3567(scalar_t* out, uint32_t* qweight, scalar_t* scale, uint32_t* zeros, int group_size, const int in_features, const int row_n) {
   int bid = blockIdx.x;
   int tid = (bid * kBlockSize + threadIdx.x);
   __shared__ uint32_t qweight_shared[WBITS * kBlockSize];
@@ -124,6 +111,7 @@ __global__ void DequantizeAndUnpackWeight3567(T* out, uint32_t* qweight, T* scal
   int total_qw = qweight_rows * row_n;
 
   uint32_t* qweight_thread = qweight_shared + WBITS * threadIdx.x;
+  using VEC2 = typename TYPE_VEC2<scalar_t>::Type;
 
   int qweight_start = tid / row_n * group_row_n + tid % row_n;
 #pragma unroll
@@ -136,7 +124,7 @@ __global__ void DequantizeAndUnpackWeight3567(T* out, uint32_t* qweight, T* scal
   const int col_ind = (tid % row_n);
   const int compress_group_size = 32;
   const int fp16_weight_in_row = tid / row_n * compress_group_size;
-  T scale_v[4];
+  scalar_t scale_v[4];
   const int scale_zero_from = fp16_weight_in_row / group_size;
   const int scale_zero_to = (fp16_weight_in_row + compress_group_size) / group_size;
 
@@ -161,12 +149,12 @@ __global__ void DequantizeAndUnpackWeight3567(T* out, uint32_t* qweight, T* scal
     }
   }
 
-  T scale_zeros[4];
+  scalar_t scale_zeros[4];
   for (int i = 0; i <= scale_zero_to - scale_zero_from; i++) {
     scale_zeros[i] = __hmul(__short2half_rn(zv1[i]), scale_v[i]);
   }
-  half2 scale_2 = __halves2half2(scale_v[0], scale_v[0]);
-  half2 scale_zeros_2 = __halves2half2(scale_zeros[0], scale_zeros[0]);
+  VEC2 scale_2 = __halves2half2(scale_v[0], scale_v[0]);
+  VEC2 scale_zeros_2 = __halves2half2(scale_zeros[0], scale_zeros[0]);
   const int out_offset = ((fp16_weight_in_row) * row_n + col_ind);
   // decompress weights
   int remains = in_features - fp16_weight_in_row;
@@ -178,12 +166,12 @@ __global__ void DequantizeAndUnpackWeight3567(T* out, uint32_t* qweight, T* scal
     wv1 = iterator_qweight<WBITS>(qweight_thread, i);
     wv2 = iterator_qweight<WBITS>(qweight_thread, 16 + i);
 
-    half2 wv = __halves2half2(__short2half_rn(wv1), __short2half_rn(wv2));
+    VEC2 wv = __halves2half2(__short2half_rn(wv1), __short2half_rn(wv2));
     if (group_size < 32) {
       scale_2 = __halves2half2(scale_v[i / group_size], scale_v[(i + 16) / group_size]);
       scale_zeros_2 = __halves2half2(scale_zeros[i / group_size], scale_zeros[(i + 16) / group_size]);
     }
-    half2 res = __hfma2(wv, scale_2, -scale_zeros_2);
+    VEC2 res = __hfma2(wv, scale_2, -scale_zeros_2);
     //if (bid == 0 && threadIdx.x == 1 && i == 1) {
     //  printf("%d,%d,%d,%d,%d,%f,%f\n", col_ind, int(wv1), int(wv2), row_n, col_ind, __half2float(wv.x), __half2float(wv.y));
     //}
@@ -194,19 +182,19 @@ __global__ void DequantizeAndUnpackWeight3567(T* out, uint32_t* qweight, T* scal
     // decompress weights
     for (int i = 0; i < remains; i++) {
       uint8_t wv1 = iterator_qweight<WBITS>(qweight_thread, i);
-      T wv = __short2half_rn(wv1);
+      scalar_t wv = __short2half_rn(wv1);
       if (group_size < 32) {
         scale_2.x = scale_v[i / group_size];
         scale_zeros_2.x = scale_zeros[i / group_size];
       }
-      T res = __hfma(wv, scale_2.x, -scale_zeros_2.x);
+      scalar_t res = __hfma(wv, scale_2.x, -scale_zeros_2.x);
       out[out_offset + i * row_n] = res;
     }
   }
 }
 
-template <typename T, int WBITS>
-__device__ __forceinline__ uchar2 iterator_qweight_v2(const T* ptr, int idx) {
+template <typename scalar_t, int WBITS>
+__device__ __forceinline__ uchar2 iterator_qweight_v2(const scalar_t* ptr, int idx) {
   int start_bits = idx * WBITS;
   int first = start_bits / 32;
   int end_bits = (start_bits + WBITS);
@@ -228,13 +216,14 @@ __device__ __forceinline__ uchar2 iterator_qweight_v2(const T* ptr, int idx) {
   }
 }
 
-template <typename T, int WBITS>
-__global__ void DequantizeAndUnpackWeight3567_v2(T* out, const uint32_t* qweight, const T* scale, const uint32_t* zeros, int group_size, const int in_features, const int row_n, uint8_t add_zero_bias) {
+template <typename scalar_t, int WBITS>
+__global__ void DequantizeAndUnpackWeight3567_v2(scalar_t* out, const uint32_t* qweight, const scalar_t* scale, const uint32_t* zeros, int group_size, const int in_features, const int row_n, uint8_t add_zero_bias) {
   int bid = blockIdx.x;
   int tid = (bid * kBlockSize + threadIdx.x);
   const int qweight_rows = (in_features * WBITS + 31) / 32;
   __shared__ uint2 qweight_shared[WBITS * kBlockSize];
   const int half_n = row_n / 2;
+  using VEC2 = typename TYPE_VEC2<scalar_t>::Type;
 
   const int group_row_n = half_n * (WBITS==6?3:WBITS);
   int total_qw = qweight_rows * half_n;
@@ -253,12 +242,12 @@ __global__ void DequantizeAndUnpackWeight3567_v2(T* out, const uint32_t* qweight
   const int col_ind = (tid % half_n);
   const int compress_group_size = 32;
   const int fp16_weight_in_row = tid / half_n * compress_group_size;
-  half2 scale_v[4];
+  VEC2 scale_v[4];
   const int scale_zero_from = fp16_weight_in_row / group_size;
   const int scale_zero_to = (fp16_weight_in_row + compress_group_size) / group_size;
 
   // decompress scales
-  const half2 *scale2 = reinterpret_cast<const half2*>(scale);
+  const VEC2 *scale2 = reinterpret_cast<const VEC2*>(scale);
   for (int i = 0, scale_zero_from_i = scale_zero_from; scale_zero_from_i <= scale_zero_to; scale_zero_from_i++, i++) {
     scale_v[i] = (scale2[scale_zero_from_i * half_n + col_ind]);
   }
@@ -291,15 +280,15 @@ __global__ void DequantizeAndUnpackWeight3567_v2(T* out, const uint32_t* qweight
     }
   }
 
-  half2 scale_zeros[4];
+  VEC2 scale_zeros[4];
   for (int i = 0; i <= scale_zero_to - scale_zero_from; i++) {
     scale_zeros[i] = __hmul2(__halves2half2(__ushort2half_rn(zv1[i].x+add_zero_bias), __ushort2half_rn(zv1[i].y+add_zero_bias)), scale_v[i]);
   }
-  half2 scale_2 =  scale_v[0];
-  half2 scale_zeros_2 = scale_zeros[0];
+  VEC2 scale_2 =  scale_v[0];
+  VEC2 scale_zeros_2 = scale_zeros[0];
 
   const int out_offset = ((fp16_weight_in_row)*half_n + col_ind);
-  half2* out_h2 = reinterpret_cast<half2*>(out);
+  VEC2* out_h2 = reinterpret_cast<VEC2*>(out);
   // decompress weights
   int remains = in_features - fp16_weight_in_row;
   if (remains >= compress_group_size) {
@@ -308,18 +297,18 @@ __global__ void DequantizeAndUnpackWeight3567_v2(T* out, const uint32_t* qweight
     uchar2 wv1= iterator_qweight_v2<uint2, WBITS>(qweight_thread, i);
     uchar2 wv2 = iterator_qweight_v2<uint2, WBITS>(qweight_thread, 16 + i);
 
-    half2 wv = __halves2half2(__ushort2half_rn(wv1.x), __ushort2half_rn(wv1.y));
+    VEC2 wv = __halves2half2(__ushort2half_rn(wv1.x), __ushort2half_rn(wv1.y));
     if (group_size < 32) {
-      half2 scale_2 = scale_v[i / group_size];
-      half2 scale_zeros_2 = scale_zeros[i / group_size];
+      VEC2 scale_2 = scale_v[i / group_size];
+      VEC2 scale_zeros_2 = scale_zeros[i / group_size];
     }
-    half2 res = __hfma2(wv, scale_2, -scale_zeros_2);
+    VEC2 res = __hfma2(wv, scale_2, -scale_zeros_2);
     out_h2[out_offset + i * half_n] = res;
 
     wv = __halves2half2(__ushort2half_rn(wv2.x), __ushort2half_rn(wv2.y));
     if (group_size < 32) {
-      half2 scale_2 = scale_v[(i + 16) / group_size];
-      half2 scale_zeros_2 = scale_zeros[(i + 16) / group_size];
+      VEC2 scale_2 = scale_v[(i + 16) / group_size];
+      VEC2 scale_zeros_2 = scale_zeros[(i + 16) / group_size];
     }
     res = __hfma2(wv, scale_2, -scale_zeros_2);
     out_h2[(out_offset + (i + 16) * half_n)] = res;
@@ -329,12 +318,12 @@ __global__ void DequantizeAndUnpackWeight3567_v2(T* out, const uint32_t* qweight
     for (int i = 0; i < remains; i++) {
       uchar2 wv1 = iterator_qweight_v2<uint2, WBITS>(qweight_thread, i);
 
-      half2 wv = __halves2half2(__ushort2half_rn(wv1.x), __ushort2half_rn(wv1.y));
+      VEC2 wv = __halves2half2(__ushort2half_rn(wv1.x), __ushort2half_rn(wv1.y));
       if (group_size < 32) {
         scale_2 = scale_v[i / group_size];
         scale_zeros_2 = scale_zeros[i / group_size];
       }
-      half2 res = __hfma2(wv, scale_2, -scale_zeros_2);
+      VEC2 res = __hfma2(wv, scale_2, -scale_zeros_2);
       out_h2[out_offset + i * half_n] = res;
     }
   }
@@ -352,6 +341,7 @@ __global__ void convertFp16ToFp32(float* out, half* in, int n) {
     out[idx] = __half2float(in[idx]);
   }
 }
+
 }  // namespace cuda_quant
 #ifndef assert
 #define assert(x) \
@@ -361,7 +351,7 @@ __global__ void convertFp16ToFp32(float* out, half* in, int n) {
 #endif
 
 template <typename scalar_t>
-static void lauch_dq_248(scalar_t* b_fp16, int32_t* qweight_i32_i, scalar_t* scale_fp16, int32_t* qzeros_i32_i, int bits, int groupsize, uint32_t mat_k, uint32_t mat_n, uint8_t add_zero_bias=0) {
+void lauch_dq_248(scalar_t* b_fp16, int32_t* qweight_i32_i, scalar_t* scale_fp16, int32_t* qzeros_i32_i, int bits, int groupsize, uint32_t mat_k, uint32_t mat_n, uint8_t add_zero_bias=0) {
   if constexpr (std::is_same<scalar_t, double>::value) {
     return;
   } else if constexpr (std::is_same<scalar_t, float>::value) {
@@ -380,13 +370,13 @@ static void lauch_dq_248(scalar_t* b_fp16, int32_t* qweight_i32_i, scalar_t* sca
   using cuda_quant::DequantizeAndUnpackWeight248;
   switch(bits) {
     case 2:
-      DequantizeAndUnpackWeight248<half, 2><<<gridDim, blockDim, 0, stream>>>((half*)b_fp16, qweight_i32, (half*)scale_fp16, qzeros_i32, groupsize, mat_k, mat_n, add_zero_bias);
+      DequantizeAndUnpackWeight248<scalar_t, 2><<<gridDim, blockDim, 0, stream>>>((scalar_t*)b_fp16, qweight_i32, (scalar_t*)scale_fp16, qzeros_i32, groupsize, mat_k, mat_n, add_zero_bias);
       break;
   case 4:
-      DequantizeAndUnpackWeight248<half, 4><<<gridDim, blockDim, 0, stream>>>((half*)b_fp16, qweight_i32, (half*)scale_fp16, qzeros_i32, groupsize, mat_k, mat_n, add_zero_bias);
+      DequantizeAndUnpackWeight248<scalar_t, 4><<<gridDim, blockDim, 0, stream>>>((scalar_t*)b_fp16, qweight_i32, (scalar_t*)scale_fp16, qzeros_i32, groupsize, mat_k, mat_n, add_zero_bias);
       break;
   case 8:
-      DequantizeAndUnpackWeight248<half, 8><<<gridDim, blockDim, 0, stream>>>((half*)b_fp16, qweight_i32, (half*)scale_fp16, qzeros_i32, groupsize, mat_k, mat_n, add_zero_bias);
+      DequantizeAndUnpackWeight248<scalar_t, 8><<<gridDim, blockDim, 0, stream>>>((scalar_t*)b_fp16, qweight_i32, (scalar_t*)scale_fp16, qzeros_i32, groupsize, mat_k, mat_n, add_zero_bias);
       break;
   default:
   printf("error bits\n");
@@ -395,7 +385,7 @@ static void lauch_dq_248(scalar_t* b_fp16, int32_t* qweight_i32_i, scalar_t* sca
 }
 
 template <typename scalar_t>
-static void lauch_dq_3567(scalar_t* b_fp16, int32_t* qweight_i32_i, scalar_t* scale_fp16, int32_t* qzeros_i32_i, int bits, int groupsize, uint32_t mat_k, uint32_t mat_n, uint8_t add_zero_bias=0) {
+void lauch_dq_3567(scalar_t* b_fp16, int32_t* qweight_i32_i, scalar_t* scale_fp16, int32_t* qzeros_i32_i, int bits, int groupsize, uint32_t mat_k, uint32_t mat_n, uint8_t add_zero_bias=0) {
   if constexpr (std::is_same<scalar_t, double>::value) {
   return;
   } else if constexpr (std::is_same<scalar_t, float>::value) {
@@ -414,16 +404,16 @@ static void lauch_dq_3567(scalar_t* b_fp16, int32_t* qweight_i32_i, scalar_t* sc
   using cuda_quant::DequantizeAndUnpackWeight3567_v2;
   switch (bits) {
   case 3:
-      DequantizeAndUnpackWeight3567_v2<half, 3><<<gridDim, blockDim, 0, stream>>>((half*)b_fp16, qweight_i32, (half*)scale_fp16, qzeros_i32, groupsize, mat_k, mat_n, add_zero_bias);
+      DequantizeAndUnpackWeight3567_v2<scalar_t, 3><<<gridDim, blockDim, 0, stream>>>((scalar_t*)b_fp16, qweight_i32, (scalar_t*)scale_fp16, qzeros_i32, groupsize, mat_k, mat_n, add_zero_bias);
       break;
   case 5:
-      DequantizeAndUnpackWeight3567_v2<half, 5><<<gridDim, blockDim, 0, stream>>>((half*)b_fp16, qweight_i32, (half*)scale_fp16, qzeros_i32, groupsize, mat_k, mat_n, add_zero_bias);
+      DequantizeAndUnpackWeight3567_v2<scalar_t, 5><<<gridDim, blockDim, 0, stream>>>((scalar_t*)b_fp16, qweight_i32, (scalar_t*)scale_fp16, qzeros_i32, groupsize, mat_k, mat_n, add_zero_bias);
       break;
   case 6:
-      DequantizeAndUnpackWeight3567_v2<half, 6><<<gridDim, blockDim, 0, stream>>>((half*)b_fp16, qweight_i32, (half*)scale_fp16, qzeros_i32, groupsize, mat_k, mat_n, add_zero_bias);
+      DequantizeAndUnpackWeight3567_v2<scalar_t, 6><<<gridDim, blockDim, 0, stream>>>((scalar_t*)b_fp16, qweight_i32, (scalar_t*)scale_fp16, qzeros_i32, groupsize, mat_k, mat_n, add_zero_bias);
       break;
   case 7:
-      DequantizeAndUnpackWeight3567_v2<half, 7><<<gridDim, blockDim, 0, stream>>>((half*)b_fp16, qweight_i32, (half*)scale_fp16, qzeros_i32, groupsize, mat_k, mat_n, add_zero_bias);
+      DequantizeAndUnpackWeight3567_v2<scalar_t, 7><<<gridDim, blockDim, 0, stream>>>((scalar_t*)b_fp16, qweight_i32, (scalar_t*)scale_fp16, qzeros_i32, groupsize, mat_k, mat_n, add_zero_bias);
       break;
   default:
   printf("error bits\n");
@@ -435,14 +425,13 @@ static void lauch_dq_3567(scalar_t* b_fp16, int32_t* qweight_i32_i, scalar_t* sc
 
 void lauch_deqantize_cuda_pt_kernel(torch::Tensor& b_fp16, const torch::Tensor& qweight_i32, const torch::Tensor& scale_fp16, const torch::Tensor& qzeros_i32,
                                     int bits, int groupsize, uint32_t mat_k, uint32_t mat_n, uint8_t add_zero_bias) {
+
+  using scalar_t_map = half;
+
   if (bits == 2 || bits == 4 || bits == 8) {
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(b_fp16.scalar_type(), "lauch_deqantize_cuda_pt_kernel", ([&] {
-      lauch_dq_248<scalar_t>(b_fp16.data_ptr<scalar_t>(), qweight_i32.data_ptr<int32_t>(), scale_fp16.data_ptr<scalar_t>(), qzeros_i32.data_ptr<int32_t>(), bits, groupsize, mat_k, mat_n, add_zero_bias);
-    }));
+  lauch_dq_248<scalar_t_map>(b_fp16.data_ptr<scalar_t_map>(), qweight_i32.data_ptr<int32_t>(), scale_fp16.data_ptr<scalar_t_map>(), qzeros_i32.data_ptr<int32_t>(), bits, groupsize, mat_k, mat_n, add_zero_bias);
   } else {
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(b_fp16.scalar_type(), "lauch_deqantize_cuda_pt_kernel", ([&] {
-      lauch_dq_3567<scalar_t>(b_fp16.data_ptr<scalar_t>(), qweight_i32.data_ptr<int32_t>(), scale_fp16.data_ptr<scalar_t>(), qzeros_i32.data_ptr<int32_t>(), bits, groupsize, mat_k, mat_n, add_zero_bias);
-    }));
+  lauch_dq_3567<scalar_t_map>(b_fp16.data_ptr<scalar_t_map>(), qweight_i32.data_ptr<int32_t>(), scale_fp16.data_ptr<scalar_t_map>(), qzeros_i32.data_ptr<int32_t>(), bits, groupsize, mat_k, mat_n, add_zero_bias);
   }
   cudaError_t err = cudaGetLastError();
   if (cudaSuccess != err) {

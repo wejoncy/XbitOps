@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstdlib>
 
+#include "common.cuh"
 #ifdef __use_torch__
 #include <torch/extension.h>
 #include "ATen/ATen.h"
@@ -31,37 +32,39 @@ __device__ __forceinline__ float warpReduceSum(float sum) {
   return sum;
 }
 
-template <typename T>
-__global__ void gemv(T* out, const T* inA, const uint32_t* inB, const T* scales, const uint32_t* qzeros, int32_t groupsize, int32_t size_k, int32_t size_n, uint8_t add_zero_bias) {
+template <typename scalar_t>
+__global__ void gemv(scalar_t* out, const scalar_t* inA, const uint32_t* inB, const scalar_t* scales, const uint32_t* qzeros, int32_t groupsize, int32_t size_k, int32_t size_n, uint8_t add_zero_bias) {
   int bid = blockIdx.x;
-  //__shared__ T vecA[size_k];
+  //__shared__ scalar_t vecA[size_k];
   __shared__ float bsum[2][32][32 + 1];
   float sum[2] = {0, 0};
   const int block_k = ((size_k + 31) / 32 + 7) / 8 * 8;
   int y_start = threadIdx.y * block_k;
-  half2 res2 = {};
-  half2 res2_1 = {};
+  using VEC2 = typename cuda_quant::TYPE_VEC2<scalar_t>::Type;
 
-  const half2* inA_start = (const half2*)(inA + blockIdx.y * size_k + y_start);
+  VEC2 res2 = {};
+  VEC2 res2_1 = {};
+
+  const VEC2* inA_start = (const VEC2*)(inA + blockIdx.y * size_k + y_start);
 
   int n_offset_x = bid * width_element_per_block + threadIdx.x * 2;
 
   int start_group_id = (y_start / groupsize);
   int compressed_idx = threadIdx.x % 4;
-  half2 scale = ((half2*)(scales + start_group_id * size_n + n_offset_x))[0];
+  VEC2 scale = ((VEC2*)(scales + start_group_id * size_n + n_offset_x))[0];
   int32_t qzero_p = ((int32_t*)(qzeros + n_offset_x / 8 +
                                 start_group_id * ((size_n + 7) / 8)))[0];
   uint8_t zero_1 =(qzero_p >> (8 * (compressed_idx))) & 0xf;
   uint8_t zero_2 = ((qzero_p) >> (8 * (compressed_idx) + 4)) & 0xf;
-  half2 hzero = __halves2half2(__int2half_rn(zero_1+add_zero_bias),
+  VEC2 hzero = __halves2half2(__int2half_rn(zero_1+add_zero_bias),
                                __int2half_rn(zero_2+add_zero_bias));
-  half2 scale_h0 = __half2half2(scale.x);
-  half2 scale_h1 = __half2half2(scale.y);
-  half2 hzero_scale_0 = __half2half2(hzero.x * scale.x);
-  half2 hzero_scale_1 = __half2half2(hzero.y * scale.y);
+  VEC2 scale_h0 = __half2half2(scale.x);
+  VEC2 scale_h1 = __half2half2(scale.y);
+  VEC2 hzero_scale_0 = __half2half2(hzero.x * scale.x);
+  VEC2 hzero_scale_1 = __half2half2(hzero.y * scale.y);
 
 #pragma unroll
-  for (int i = 0; i < block_k / 2; i += 4) {  // read half2 * 4
+  for (int i = 0; i < block_k / 2; i += 4) {  // read VEC2 * 4
     res2 = {};
     res2_1 = {};
     int k_offset = y_start + i * 2;
@@ -73,7 +76,7 @@ __global__ void gemv(T* out, const T* inA, const uint32_t* inB, const T* scales,
     uint32_t vbInt2 = (n_offset_x + 1 < size_n && (k_offset < size_k))
                           ? (hinB)[1]
                           : int32_t(0);
-    half2 vb[8];
+    VEC2 vb[8];
     uint8_t* qweight_p1 = (uint8_t*)&vbInt1;
     uint8_t* qweight_p2 = (uint8_t*)&vbInt2;
 
@@ -92,7 +95,7 @@ __global__ void gemv(T* out, const T* inA, const uint32_t* inB, const T* scales,
     }
 
     if (g_id > start_group_id) {
-      scale = ((const half2*)(scales + g_id * size_n + n_offset_x))[0];
+      scale = ((const VEC2*)(scales + g_id * size_n + n_offset_x))[0];
       qzero_p = ((const int32_t*)(qzeros + n_offset_x / 8 + g_id * ((size_n + 7) / 8)))[0];
       hzero = __halves2half2(__int2half_rn((qzero_p >> (8 * (compressed_idx))) & 0xf),
                              __int2half_rn(((qzero_p) >> (8 * (compressed_idx) + 4)) & 0xf));
@@ -103,7 +106,7 @@ __global__ void gemv(T* out, const T* inA, const uint32_t* inB, const T* scales,
       start_group_id++;
     }
 
-    half2 va[4];
+    VEC2 va[4];
     va[0] = (k_offset < size_k) ? ((inA_start))[i] : res2;
     va[1] = (k_offset + 1 < size_k) ? ((inA_start))[i + 1] : res2;
     va[2] = (k_offset + 2 < size_k) ? ((inA_start))[i + 2] : res2;
